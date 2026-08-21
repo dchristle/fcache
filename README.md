@@ -12,9 +12,12 @@ The first GitHub release is planned to provide these prebuilt archives:
 
 | Host | Release target |
 | --- | --- |
-| macOS on Apple silicon | `aarch64-apple-darwin` |
-| macOS on Intel | `x86_64-apple-darwin` |
-| Linux on x86-64 | `x86_64-unknown-linux-musl` |
+| macOS 11 or newer on Apple silicon | `aarch64-apple-darwin` |
+| macOS 11 or newer on Intel | `x86_64-apple-darwin` |
+| Linux on x86-64 with glibc 2.28 or newer | `x86_64-unknown-linux-gnu` |
+| Linux on x86-64, statically linked with musl | `x86_64-unknown-linux-musl` |
+
+The GNU archive is the conventional choice for mainstream Linux distributions. The musl archive avoids a runtime libc dependency and is useful when a more self-contained fcache executable is preferred. Both archives still require the separately installed `gfortran` toolchain that performs the compilation.
 
 When a release is available, download the archive for the host and its matching `.sha256` file from the release page. Verify it before extracting:
 
@@ -155,7 +158,9 @@ This project is dual licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-A
 
 ## Releases
 
-The release workflow uses `vX.Y.Z` tags whose version exactly matches `Cargo.toml`. A tag push will build the three archives listed above, publish an individual SHA-256 file for each archive plus a combined `SHA256SUMS`, and create the GitHub release. A build or version mismatch prevents publication. Release binaries will use the Rust version pinned in `rust-toolchain.toml`.
+The release workflow uses `vX.Y.Z` tags whose version exactly matches `Cargo.toml`. A tag push will build the four archives listed above, publish an individual SHA-256 file for each archive plus a combined `SHA256SUMS`, attest the archives, and create the GitHub release. A build or version mismatch prevents publication. Release binaries use the Rust version pinned in `rust-toolchain.toml` and do not enable host-specific CPU features.
+
+Each packaged executable runs natively on its build host and must reproduce an object, module, and depfile byte for byte across a cold and warm fcache build. The workflow also checks both macOS architectures and their deployment target, verifies that the musl binary has no shared-library interpreter or dependency, and rejects GNU binaries that require glibc symbols newer than 2.28. A manual workflow dispatch performs the same build, package, smoke-test, and audit stages without publishing a release.
 
 Because fcache is pre-1.0, command behavior, configuration, and cache formats may still change between minor versions. Upgrade notes belong in the changelog. Existing cache entries may be discarded after an incompatible change; source and build outputs must remain unaffected.
 

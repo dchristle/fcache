@@ -1,6 +1,7 @@
 name: Release
 
 on:
+  workflow_dispatch:
   push:
     tags:
       - "v[0-9]*"
@@ -45,7 +46,7 @@ jobs:
       - name: Check dependency policy
         uses: EmbarkStudios/cargo-deny-action@b66acf5e9fe20f8aba065be86778a8a4c846f902 # v2
 
-  build:
+  build-portable:
     name: Build ${{ matrix.target }}
     needs: verify
     runs-on: ${{ matrix.os }}
@@ -54,55 +55,97 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: macos-14
+          - os: macos-15
             target: aarch64-apple-darwin
-          - os: macos-14
+            platform: macos
+            binary_architecture: arm64
+            macos_minimum: "11.0"
+          - os: macos-15-intel
             target: x86_64-apple-darwin
+            platform: macos
+            binary_architecture: x86_64
+            macos_minimum: "11.0"
           - os: ubuntu-24.04
             target: x86_64-unknown-linux-musl
+            platform: musl
+            binary_architecture: x86_64
+            macos_minimum: ""
+    env:
+      MACOSX_DEPLOYMENT_TARGET: ${{ matrix.macos_minimum }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - name: Validate release tag
-        shell: bash
-        run: |
-          version="${GITHUB_REF_NAME#v}"
-          manifest_version="$(cargo metadata --locked --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "fortran-fcache") | .version')"
-          if [[ "$version" != "$manifest_version" ]]; then
-            echo "Tag version $version does not match Cargo.toml version $manifest_version" >&2
-            exit 1
-          fi
-          echo "FCACHE_RELEASE_VERSION=$version" >> "$GITHUB_ENV"
-
-      - name: Install musl compiler
+      - name: Install release dependencies (Linux)
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install --no-install-recommends -y musl-tools
+          sudo apt-get install --no-install-recommends -y binutils gfortran musl-tools python3
+
+      - name: Install release dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: brew install gcc
 
       - name: Install Rust target
         run: |
           rustup toolchain install 1.97.1 --profile minimal
           rustup target add --toolchain 1.97.1 "${{ matrix.target }}"
 
+      - name: Resolve release version
+        shell: bash
+        run: |
+          manifest_version="$(cargo +1.97.1 metadata --locked --no-deps --format-version 1 | python3 -c 'import json, sys; print(next(package["version"] for package in json.load(sys.stdin)["packages"] if package["name"] == "fortran-fcache"))')"
+          version="$manifest_version"
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            version="${GITHUB_REF_NAME#v}"
+            if [[ "$version" != "$manifest_version" ]]; then
+              echo "Tag version $version does not match Cargo.toml version $manifest_version" >&2
+              exit 1
+            fi
+          fi
+          echo "FCACHE_RELEASE_VERSION=$version" >> "$GITHUB_ENV"
+          echo "FCACHE_PACKAGE=fcache-$version-${{ matrix.target }}" >> "$GITHUB_ENV"
+
       - name: Build release binary
         run: cargo +1.97.1 build --locked --release --target "${{ matrix.target }}"
 
       - name: Package archive
+        run: scripts/package_release.sh "$FCACHE_RELEASE_VERSION" "${{ matrix.target }}"
+
+      - name: Smoke-test packaged binary
         shell: bash
         run: |
-          package="fcache-${FCACHE_RELEASE_VERSION}-${{ matrix.target }}"
-          install -d "dist/$package"
-          install -m 755 "target/${{ matrix.target }}/release/fcache" "dist/$package/fcache"
-          install -d "dist/$package/scripts"
-          install -m 755 scripts/benchmark_acceptance.py "dist/$package/scripts/benchmark_acceptance.py"
-          cp README.md CHANGELOG.md LICENSE-APACHE LICENSE-MIT "dist/$package/"
-          COPYFILE_DISABLE=1 tar -C dist -czf "dist/$package.tar.gz" "$package"
-          cd dist
-          if command -v sha256sum >/dev/null 2>&1; then
-            sha256sum "$package.tar.gz" > "$package.tar.gz.sha256"
-          else
-            shasum -a 256 "$package.tar.gz" > "$package.tar.gz.sha256"
+          smoke_dir="$RUNNER_TEMP/fcache-release-smoke"
+          mkdir -p "$smoke_dir"
+          tar -C "$smoke_dir" -xzf "dist/$FCACHE_PACKAGE.tar.gz"
+          scripts/smoke_release_binary.sh "$smoke_dir/$FCACHE_PACKAGE/fcache"
+
+      - name: Audit macOS binary
+        if: matrix.platform == 'macos'
+        shell: bash
+        run: |
+          binary="dist/$FCACHE_PACKAGE/fcache"
+          file "$binary"
+          actual_architecture="$(lipo -archs "$binary")"
+          test "$actual_architecture" = "${{ matrix.binary_architecture }}"
+          minimum="$(otool -l "$binary" | awk '/minos/ { print $2; exit }')"
+          if [[ "$minimum" != "${{ matrix.macos_minimum }}" ]]; then
+            echo "Expected macOS minimum ${{ matrix.macos_minimum }}, found $minimum" >&2
+            exit 1
+          fi
+
+      - name: Audit static musl binary
+        if: matrix.platform == 'musl'
+        shell: bash
+        run: |
+          binary="dist/$FCACHE_PACKAGE/fcache"
+          file "$binary"
+          if readelf --program-headers "$binary" | grep INTERP >/dev/null; then
+            echo "musl release binary unexpectedly contains a program interpreter" >&2
+            exit 1
+          fi
+          if readelf --dynamic "$binary" | grep NEEDED >/dev/null; then
+            echo "musl release binary unexpectedly depends on a shared library" >&2
+            exit 1
           fi
 
       - name: Upload release archive
@@ -115,9 +158,91 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  build-gnu:
+    name: Build x86_64-unknown-linux-gnu
+    needs: verify
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    container: rockylinux:8.10
+    steps:
+      - name: Install build and audit dependencies
+        run: dnf install -y binutils ca-certificates file gcc gcc-gfortran git gzip python3 tar
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
+        with:
+          toolchain: 1.97.1
+          target: x86_64-unknown-linux-gnu
+
+      - name: Resolve release version
+        shell: bash
+        run: |
+          manifest_version="$(cargo metadata --locked --no-deps --format-version 1 | python3 -c 'import json, sys; print(next(package["version"] for package in json.load(sys.stdin)["packages"] if package["name"] == "fortran-fcache"))')"
+          version="$manifest_version"
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            version="${GITHUB_REF_NAME#v}"
+            if [[ "$version" != "$manifest_version" ]]; then
+              echo "Tag version $version does not match Cargo.toml version $manifest_version" >&2
+              exit 1
+            fi
+          fi
+          echo "FCACHE_RELEASE_VERSION=$version" >> "$GITHUB_ENV"
+          echo "FCACHE_PACKAGE=fcache-$version-x86_64-unknown-linux-gnu" >> "$GITHUB_ENV"
+
+      - name: Build release binary
+        run: cargo build --locked --release --target x86_64-unknown-linux-gnu
+
+      - name: Package archive
+        run: scripts/package_release.sh "$FCACHE_RELEASE_VERSION" x86_64-unknown-linux-gnu
+
+      - name: Smoke-test packaged binary on glibc 2.28
+        shell: bash
+        run: |
+          smoke_dir="$RUNNER_TEMP/fcache-release-smoke"
+          mkdir -p "$smoke_dir"
+          tar -C "$smoke_dir" -xzf "dist/$FCACHE_PACKAGE.tar.gz"
+          scripts/smoke_release_binary.sh "$smoke_dir/$FCACHE_PACKAGE/fcache"
+
+      - name: Audit glibc compatibility
+        shell: bash
+        run: |
+          binary="dist/$FCACHE_PACKAGE/fcache"
+          file "$binary"
+          if ! readelf --program-headers "$binary" | grep 'Requesting program interpreter' >/dev/null; then
+            echo "GNU Linux release binary is not dynamically linked" >&2
+            exit 1
+          fi
+          objdump --dynamic-syms "$binary" | python3 -c '
+          import re
+          import sys
+
+          versions = {
+              tuple(map(int, match))
+              for match in re.findall(r"GLIBC_(\d+)\.(\d+)", sys.stdin.read())
+          }
+          if not versions:
+              raise SystemExit("GNU Linux release binary has no GLIBC symbol requirements")
+          maximum = max(versions)
+          print(f"maximum required glibc symbol version: {maximum[0]}.{maximum[1]}")
+          if maximum > (2, 28):
+              raise SystemExit("GNU Linux release binary requires glibc newer than 2.28")
+          '
+
+      - name: Upload release archive
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-x86_64-unknown-linux-gnu
+          path: |
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 7
+
   publish:
     name: Publish GitHub release
-    needs: build
+    if: github.ref_type == 'tag'
+    needs: [build-portable, build-gnu]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:

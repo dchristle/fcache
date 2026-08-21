@@ -16,7 +16,8 @@ The first public release is planned as `0.1.0-alpha.1`.
 - Validated direct lookup capable of compiler-process-free warm hits, with `auto` and fully recomputed `strict` compiler-identity modes.
 - Tested support for GNU Fortran 11 through 16 on Linux, the current Homebrew GNU Fortran toolchain on macOS, and the flags exercised by real WSJT-X builds.
 - A portable CMake acceptance harness for direct, cold, and warm builds, plus four-build correctness validation with byte-identical artifact comparison.
-- A tag-driven release workflow for macOS and Linux archives, SHA-256 checksums, and build provenance attestations.
+- A tag-driven release workflow for native Apple silicon and Intel macOS binaries, plus GNU/glibc and static musl Linux x86-64 binaries, SHA-256 checksums, and build provenance attestations.
+- Packaged-binary release qualification covering native execution, cold/warm object, module, and depfile identity, architecture and linkage audits, the macOS 11 deployment target, and the glibc 2.28 symbol ceiling.
 - The Cargo package name `fortran-fcache`, with the executable and Rust library named `fcache`.
 
 ### Correctness and safety
