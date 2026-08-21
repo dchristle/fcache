@@ -166,7 +166,7 @@ jobs:
     container: rockylinux/rockylinux:8.10@sha256:e8a49c5403b687db05d4d67333fa45808fbe74f36e683cec7abb1f7d0f2338c6
     steps:
       - name: Install build and audit dependencies
-        run: dnf install -y binutils ca-certificates diffutils file gcc gcc-gfortran git gzip python3 tar
+        run: dnf install -y binutils ca-certificates diffutils file gcc gcc-toolset-11-gcc-gfortran git gzip python3 tar
 
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
@@ -202,7 +202,9 @@ jobs:
           smoke_dir="$RUNNER_TEMP/fcache-release-smoke"
           mkdir -p "$smoke_dir"
           tar -C "$smoke_dir" -xzf "dist/$FCACHE_PACKAGE.tar.gz"
-          scripts/smoke_release_binary.sh "$smoke_dir/$FCACHE_PACKAGE/fcache"
+          scripts/smoke_release_binary.sh \
+            "$smoke_dir/$FCACHE_PACKAGE/fcache" \
+            /opt/rh/gcc-toolset-11/root/usr/bin/gfortran
 
       - name: Audit glibc compatibility
         shell: bash
