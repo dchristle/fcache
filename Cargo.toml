@@ -1,0 +1,51 @@
+[package]
+name = "fortran-fcache"
+version = "0.1.0-alpha.1"
+edition = "2024"
+rust-version = "1.85"
+description = "A correctness-first compiler cache for modern Fortran"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+categories = ["command-line-utilities", "development-tools::build-utils"]
+keywords = ["fortran", "compiler", "cache", "gfortran"]
+publish = false
+
+[lib]
+name = "fcache"
+path = "src/lib.rs"
+
+[[bin]]
+name = "fcache"
+path = "src/main.rs"
+
+[workspace]
+members = ["."]
+resolver = "3"
+
+[dependencies]
+blake3 = "1.8"
+clap = { version = "4.6", features = ["derive"] }
+directories = "6.0"
+fs4 = { version = "1.1", features = ["sync"] }
+rustix = { version = "1.1", features = ["fs", "process"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tempfile = "3.27"
+thiserror = "2.0"
+toml = "1.1"
+
+[dev-dependencies]
+assert_cmd = "2.1"
+filetime = "0.2"
+predicates = "3.1"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = "warn"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

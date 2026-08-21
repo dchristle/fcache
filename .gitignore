@@ -1,0 +1,15 @@
+/target/
+/build/
+/cmake-build-*/
+.DS_Store
+*.swp
+*.swo
+*.tmp
+*.log
+__pycache__/
+*.py[cod]
+.env
+.env.*
+/.cargo/
+/.idea/
+/.vscode/
