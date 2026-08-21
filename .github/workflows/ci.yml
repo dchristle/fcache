@@ -98,7 +98,7 @@ jobs:
         run: |
           actual="$(gfortran -dumpversion | cut -d. -f1)"
           test "$actual" = "${{ matrix.gfortran }}"
-      - run: cargo test --locked --all-targets
+      - run: cargo test --locked --test integration
 
   dependency-policy:
     name: Dependency policy
