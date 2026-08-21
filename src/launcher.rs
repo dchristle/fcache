@@ -35,6 +35,7 @@ use crate::process::{CompilerCommand, CompilerOutput, exec_compiler};
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::ffi::{OsStr, OsString};
+use std::fmt::Write as _;
 use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -490,7 +491,11 @@ fn emit_explain(report: ExplainReport, json: bool, exit_code: i32) -> Result<i32
 }
 
 fn hex_digest(digest: [u8; 32]) -> String {
-    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+    let mut output = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        write!(output, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    output
 }
 
 fn run_compiler(arguments: Vec<OsString>, config: &Config) -> Result<i32, String> {
@@ -2385,6 +2390,10 @@ fn build_action_key(
 fn effective_umask() -> u32 {
     let previous = rustix::process::umask(rustix::fs::Mode::empty());
     rustix::process::umask(previous);
+    #[allow(
+        clippy::useless_conversion,
+        reason = "mode_t widths differ across supported Unix targets"
+    )]
     u32::from(previous.bits())
 }
 

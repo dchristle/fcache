@@ -62,7 +62,7 @@ jobs:
     steps:
       - name: Install toolchain and compiler
         run: |
-          pacman -Syu --noconfirm --needed base-devel cmake git gfortran ninja rust
+          pacman -Syu --noconfirm --needed base-devel cmake gcc-fortran git ninja rust
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Verify required build tools
         run: |

@@ -30,7 +30,7 @@ impl ActionKey {
         }
         let mut out = [0; 32];
         for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
-            out[index] = hex_nibble(pair[0])? << 4 | hex_nibble(pair[1])?;
+            out[index] = (hex_nibble(pair[0])? << 4) | hex_nibble(pair[1])?;
         }
         Ok(Self(out))
     }

@@ -2,6 +2,7 @@
 
 use std::env;
 use std::ffi::{OsStr, OsString};
+use std::fmt::Write as _;
 use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -59,7 +60,11 @@ impl CompilerFingerprint {
     }
 
     pub fn digest_hex(&self) -> String {
-        self.digest.iter().map(|byte| format!("{byte:02x}")).collect()
+        let mut output = String::with_capacity(self.digest.len() * 2);
+        for byte in self.digest {
+            write!(output, "{byte:02x}").expect("writing to a String cannot fail");
+        }
+        output
     }
 }
 

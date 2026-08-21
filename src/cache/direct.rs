@@ -1374,7 +1374,7 @@ fn hex_decode(value: &str) -> Result<Vec<u8>, &'static str> {
     for pair in value.as_bytes().chunks_exact(2) {
         let high = hex_nibble(pair[0])?;
         let low = hex_nibble(pair[1])?;
-        decoded.push(high << 4 | low);
+        decoded.push((high << 4) | low);
     }
     Ok(decoded)
 }
