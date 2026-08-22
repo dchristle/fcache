@@ -274,9 +274,14 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          release_flags=()
+          if [[ "${GITHUB_REF_NAME#v}" == *-* ]]; then
+            release_flags+=(--prerelease)
+          fi
           gh release create "$GITHUB_REF_NAME" \
             --repo "$GITHUB_REPOSITORY" \
             --verify-tag \
             --title "fcache ${GITHUB_REF_NAME#v}" \
             --generate-notes \
+            "${release_flags[@]}" \
             dist/*
