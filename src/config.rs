@@ -13,12 +13,19 @@ pub struct Config {
     pub read_only: bool,
     pub direct: bool,
     pub compiler_identity: CompilerIdentityPolicy,
+    pub environment: EnvironmentPolicy,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompilerIdentityPolicy {
     Auto,
     Strict,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnvironmentPolicy {
+    Strict,
+    Compiler,
 }
 
 #[derive(Debug, Error)]
@@ -42,6 +49,7 @@ struct FileConfig {
     read_only: Option<bool>,
     direct: Option<bool>,
     compiler_identity: Option<String>,
+    environment: Option<String>,
 }
 
 impl Config {
@@ -56,6 +64,7 @@ impl Config {
             read_only: false,
             direct: true,
             compiler_identity: CompilerIdentityPolicy::Auto,
+            environment: EnvironmentPolicy::Strict,
         })
     }
 
@@ -96,6 +105,9 @@ impl Config {
             if let Some(v) = f.compiler_identity {
                 c.compiler_identity = parse_compiler_identity(&v, "compiler_identity")?;
             }
+            if let Some(v) = f.environment {
+                c.environment = parse_environment_policy(&v, "environment")?;
+            }
         }
         if let Some(v) = get_env("FCACHE_DIR") {
             c.cache_dir = PathBuf::from(v);
@@ -119,10 +131,27 @@ impl Config {
             })?;
             c.compiler_identity = parse_compiler_identity(text, "FCACHE_COMPILER_IDENTITY")?;
         }
+        if let Some(value) = get_env("FCACHE_ENVIRONMENT") {
+            let text = value.to_str().ok_or_else(|| {
+                ConfigError::Value("FCACHE_ENVIRONMENT".into(), "must be valid UTF-8".into())
+            })?;
+            c.environment = parse_environment_policy(text, "FCACHE_ENVIRONMENT")?;
+        }
         Ok(c)
     }
     pub fn config_path() -> Option<PathBuf> {
         BaseDirs::new().map(|b| b.config_dir().join("fcache/config.toml"))
+    }
+}
+
+fn parse_environment_policy(value: &str, name: &str) -> Result<EnvironmentPolicy, ConfigError> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "strict" => Ok(EnvironmentPolicy::Strict),
+        "compiler" => Ok(EnvironmentPolicy::Compiler),
+        other => Err(ConfigError::Value(
+            name.into(),
+            format!("expected 'strict' or 'compiler', got '{other}'"),
+        )),
     }
 }
 
@@ -254,6 +283,7 @@ mod tests {
         assert!(!config.read_only);
         assert!(config.direct);
         assert_eq!(config.compiler_identity, CompilerIdentityPolicy::Auto);
+        assert_eq!(config.environment, EnvironmentPolicy::Strict);
     }
 
     #[test]
@@ -262,7 +292,7 @@ mod tests {
         let path = directory.path().join("config.toml");
         fs::write(
             &path,
-            "dir = '/from-file'\nmax_size = '2 MiB'\nenabled = true\nread_only = false\ndirect = true\ncompiler_identity = 'strict'\n",
+            "dir = '/from-file'\nmax_size = '2 MiB'\nenabled = true\nread_only = false\ndirect = true\ncompiler_identity = 'strict'\nenvironment = 'strict'\n",
         )
         .unwrap();
 
@@ -275,6 +305,7 @@ mod tests {
                 ("FCACHE_READ_ONLY", OsString::from("on")),
                 ("FCACHE_DIRECT", OsString::from("off")),
                 ("FCACHE_COMPILER_IDENTITY", OsString::from("auto")),
+                ("FCACHE_ENVIRONMENT", OsString::from("compiler")),
             ],
             directory.path().join("default.toml"),
         )
@@ -286,6 +317,7 @@ mod tests {
         assert!(config.read_only);
         assert!(!config.direct);
         assert_eq!(config.compiler_identity, CompilerIdentityPolicy::Auto);
+        assert_eq!(config.environment, EnvironmentPolicy::Compiler);
     }
 
     #[test]
@@ -296,6 +328,16 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("expected 'auto' or 'strict'"));
+    }
+
+    #[test]
+    fn environment_policy_is_validated() {
+        let error = load_with_values(
+            &[("FCACHE_ENVIRONMENT", OsString::from("fast"))],
+            PathBuf::from("missing.toml"),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("expected 'strict' or 'compiler'"));
     }
 
     #[test]

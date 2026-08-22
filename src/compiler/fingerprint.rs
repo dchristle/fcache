@@ -19,6 +19,7 @@ pub struct FingerprintContext {
     pub driver: OsString,
     pub cwd: PathBuf,
     pub environment: Vec<(OsString, OsString)>,
+    pub key_environment: Vec<(OsString, OsString)>,
 }
 
 impl FingerprintContext {
@@ -32,14 +33,27 @@ impl FingerprintContext {
         K: Into<OsString>,
         V: Into<OsString>,
     {
+        let environment = environment
+            .into_iter()
+            .map(|(name, value)| (name.into(), value.into()))
+            .collect::<Vec<_>>();
         Self {
             driver: driver.into(),
             cwd: cwd.into(),
-            environment: environment
-                .into_iter()
-                .map(|(name, value)| (name.into(), value.into()))
-                .collect(),
+            key_environment: environment.clone(),
+            environment,
         }
+    }
+
+    pub fn key_environment<I, K, V>(mut self, environment: I) -> Self
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: Into<OsString>,
+        V: Into<OsString>,
+    {
+        self.key_environment =
+            environment.into_iter().map(|(name, value)| (name.into(), value.into())).collect();
+        self
     }
 }
 

@@ -1158,6 +1158,8 @@ fn explain_is_a_dry_run_with_stable_exit_semantics() {
         ])
         .current_dir(fixture.root.path())
         .env("FCACHE_DIR", &fixture.cache)
+        .env("FCACHE_ENVIRONMENT", "compiler")
+        .env("GITHUB_RUN_ID", "12345")
         .output()
         .expect("explain cacheable action");
     assert_success(&cacheable, "explain cacheable action");
@@ -1165,6 +1167,17 @@ fn explain_is_a_dry_run_with_stable_exit_semantics() {
         serde_json::from_slice(&cacheable.stdout).expect("parse explain JSON");
     assert_eq!(report["decision"], "cacheable");
     assert!(report["action_key"].as_str().is_some());
+    assert_eq!(report["environment"]["mode"], "compiler");
+    assert!(
+        report["environment"]["keyed"]
+            .as_array()
+            .is_some_and(|names| { names.iter().any(|name| name == "PATH") })
+    );
+    assert!(
+        report["environment"]["ignored"]
+            .as_array()
+            .is_some_and(|names| { names.iter().any(|name| name == "GITHUB_RUN_ID") })
+    );
     assert_eq!(tree_snapshot(&fixture), baseline, "explain modified the build tree");
     assert!(!fixture.cache.join("v1/stats").exists(), "explain updated statistics");
 
@@ -2112,6 +2125,112 @@ fn make_jobserver_metadata_does_not_change_the_action_key() {
     assert_eq!(result.requests, 2);
     assert_eq!(result.hits, 1);
     assert_eq!(result.misses, 1);
+}
+
+#[test]
+fn strict_environment_changes_miss_by_default() {
+    if !gfortran_available() {
+        return;
+    }
+    let fixture = Fixture::new();
+    fixture.copy_fixture("basic.F90");
+    let arguments = ["-c", "basic.F90", "-o", "basic.o"];
+
+    assert_success(
+        &cached_output_with_env(&fixture, &arguments, &[("GITHUB_RUN_ID", "100")]),
+        "strict compile with first CI run ID",
+    );
+    fixture.remove_outputs(&["basic.o"]);
+    assert_success(
+        &cached_output_with_env(&fixture, &arguments, &[("GITHUB_RUN_ID", "200")]),
+        "strict compile with second CI run ID",
+    );
+
+    let result = stats(&fixture);
+    assert_eq!(result.requests, 2);
+    assert_eq!(result.hits, 0);
+    assert_eq!(result.misses, 2);
+}
+
+#[test]
+fn compiler_environment_ignores_ci_metadata_but_keys_toolchain_inputs() {
+    if !gfortran_available() {
+        return;
+    }
+    let fixture = Fixture::new();
+    fixture.copy_fixture("basic.F90");
+    let arguments = ["-c", "basic.F90", "-o", "basic.o"];
+
+    assert_success(
+        &cached_output_with_env(
+            &fixture,
+            &arguments,
+            &[
+                ("FCACHE_ENVIRONMENT", "compiler"),
+                ("GITHUB_RUN_ID", "100"),
+                ("SOURCE_DATE_EPOCH", "1000"),
+            ],
+        ),
+        "modeled compile with first CI run ID",
+    );
+    let expected = fs::read(fixture.path("basic.o")).expect("read modeled cold object");
+    fixture.remove_outputs(&["basic.o"]);
+    assert_success(
+        &cached_output_with_env(
+            &fixture,
+            &arguments,
+            &[
+                ("FCACHE_ENVIRONMENT", "compiler"),
+                ("GITHUB_RUN_ID", "200"),
+                ("SOURCE_DATE_EPOCH", "1000"),
+            ],
+        ),
+        "modeled compile with second CI run ID",
+    );
+    assert_eq!(fs::read(fixture.path("basic.o")).expect("read modeled hit object"), expected);
+    fixture.remove_outputs(&["basic.o"]);
+    assert_success(
+        &cached_output_with_env(
+            &fixture,
+            &arguments,
+            &[
+                ("FCACHE_ENVIRONMENT", "compiler"),
+                ("GITHUB_RUN_ID", "300"),
+                ("SOURCE_DATE_EPOCH", "2000"),
+            ],
+        ),
+        "modeled compile with changed compiler input",
+    );
+
+    let result = stats(&fixture);
+    assert_eq!(result.requests, 3);
+    assert_eq!(result.hits, 1);
+    assert_eq!(result.misses, 2);
+}
+
+#[test]
+fn dependency_output_environment_bypasses_cache() {
+    if !gfortran_available() {
+        return;
+    }
+    let fixture = Fixture::new();
+    fixture.copy_fixture("basic.F90");
+    let arguments = ["-cpp", "-c", "basic.F90", "-o", "basic.o"];
+
+    assert_success(
+        &cached_output_with_env(
+            &fixture,
+            &arguments,
+            &[("FCACHE_ENVIRONMENT", "compiler"), ("DEPENDENCIES_OUTPUT", "external.d")],
+        ),
+        "compile with dependency output environment",
+    );
+    assert!(fixture.path("basic.o").is_file());
+
+    let result = stats(&fixture);
+    assert_eq!(result.requests, 1);
+    assert_eq!(result.lookup_results.not_attempted, 1);
+    assert_eq!(result.bypass_reasons.get("environment-dependencies-output"), Some(&1));
 }
 
 #[test]

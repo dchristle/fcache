@@ -519,8 +519,8 @@ fn context_key(context: &FingerprintContext) -> String {
     hash_key_field(&mut hasher, b"fcache-compiler-identity-context-v1");
     hash_key_field(&mut hasher, &encoded(&context.driver));
     hash_key_field(&mut hasher, &path_bytes(&context.cwd));
-    hasher.update(&(context.environment.len() as u64).to_le_bytes());
-    for (name, value) in &context.environment {
+    hasher.update(&(context.key_environment.len() as u64).to_le_bytes());
+    for (name, value) in &context.key_environment {
         hash_key_field(&mut hasher, &encoded(name));
         hash_key_field(&mut hasher, &encoded(value));
     }
@@ -696,6 +696,25 @@ mod tests {
         let first = FingerprintContext::new("gfortran", "/tmp", [("A", "1"), ("B", "2")]);
         let second = FingerprintContext::new("gfortran", "/tmp", [("B", "2"), ("A", "1")]);
         assert_ne!(context_key(&first), context_key(&second));
+    }
+
+    #[test]
+    fn context_key_can_model_less_environment_than_compiler_queries_receive() {
+        let first = FingerprintContext::new(
+            "gfortran",
+            "/tmp",
+            [("PATH", "/bin"), ("GITHUB_RUN_ID", "100")],
+        )
+        .key_environment([("PATH", "/bin")]);
+        let second = FingerprintContext::new(
+            "gfortran",
+            "/tmp",
+            [("PATH", "/bin"), ("GITHUB_RUN_ID", "200")],
+        )
+        .key_environment([("PATH", "/bin")]);
+
+        assert_ne!(first.environment, second.environment);
+        assert_eq!(context_key(&first), context_key(&second));
     }
 
     #[test]

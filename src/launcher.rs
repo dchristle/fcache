@@ -20,7 +20,9 @@ use crate::cache::stats::{Stats, StatsStore};
 use crate::cache::store::{CacheError, CacheStore, RestoreDestinations};
 use crate::cli::Command;
 use crate::compiler::depfile::{Depfile, parse_depfile};
-use crate::compiler::fingerprint::{CompilerFingerprint, FingerprintContext, fingerprint_gfortran};
+use crate::compiler::fingerprint::{
+    CompilerFingerprint, FingerprintContext, fingerprint_gfortran_in,
+};
 use crate::compiler::gfortran::resolution::{
     DependencyObservation, DependencyResolutionKind, EnvironmentSearchPaths,
     ObservedSearchFeatures, ResolutionContext,
@@ -30,7 +32,7 @@ use crate::compiler::gfortran::{
     parse_gfortran_args,
 };
 use crate::compiler::identity::{CompilerIdentityCache, IdentityMode, ValidatedCompilerIdentity};
-use crate::config::{CompilerIdentityPolicy, Config};
+use crate::config::{CompilerIdentityPolicy, Config, EnvironmentPolicy};
 use crate::process::{CompilerCommand, CompilerOutput, exec_compiler};
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
@@ -64,11 +66,19 @@ struct ExplainReport {
     compiler_major: Option<u32>,
     compiler_digest: Option<String>,
     action_key: Option<String>,
+    environment: ExplainEnvironment,
     inputs: Vec<ExplainInput>,
     outputs: Vec<ExplainOutput>,
 }
 
-const KEY_SCHEMA: &[u8] = b"fcache-gfortran-action-v10";
+#[derive(serde::Serialize)]
+struct ExplainEnvironment {
+    mode: &'static str,
+    keyed: Vec<String>,
+    ignored: Vec<String>,
+}
+
+const KEY_SCHEMA: &[u8] = b"fcache-gfortran-action-v11";
 const MIN_GFORTRAN_MAJOR: u32 = 11;
 const MAX_GFORTRAN_MAJOR: u32 = 16;
 
@@ -245,7 +255,6 @@ fn run_inner() -> Result<i32, String> {
             print_help();
             return Ok(0);
         }
-        Command::Explain { arguments, json } => return explain(arguments, *json),
         Command::Compiler(arguments)
             if crate::config::disabled_by_env().map_err(|e| e.to_string())? =>
         {
@@ -260,7 +269,7 @@ fn run_inner() -> Result<i32, String> {
     let config = Config::load().map_err(|error| error.to_string())?;
     match command {
         Command::Compiler(arguments) => run_compiler(arguments, &config),
-        Command::Explain { .. } => unreachable!("explain handled before configuration loading"),
+        Command::Explain { arguments, json } => explain(&arguments, json, &config),
         Command::ShowStats { json } => show_stats(&config, json),
         Command::ZeroStats => {
             StatsStore::new(&config.cache_dir)
@@ -281,6 +290,7 @@ fn run_inner() -> Result<i32, String> {
                     crate::config::CompilerIdentityPolicy::Strict => "strict",
                 }
             );
+            println!("environment = {}", environment_policy_name(config.environment));
             Ok(0)
         }
         Command::Trim => {
@@ -300,7 +310,7 @@ fn run_inner() -> Result<i32, String> {
     }
 }
 
-fn explain(arguments: &[OsString], json: bool) -> Result<i32, String> {
+fn explain(arguments: &[OsString], json: bool, config: &Config) -> Result<i32, String> {
     let Some((compiler, compiler_args)) = arguments.split_first() else {
         return Err("--explain requires a compiler command".into());
     };
@@ -313,6 +323,7 @@ fn explain(arguments: &[OsString], json: bool) -> Result<i32, String> {
                 compiler_major: None,
                 compiler_digest: None,
                 action_key: None,
+                environment: explain_environment(&environment, config.environment),
                 inputs: Vec::new(),
                 outputs: Vec::new(),
             },
@@ -329,6 +340,7 @@ fn explain(arguments: &[OsString], json: bool) -> Result<i32, String> {
                 compiler_major: None,
                 compiler_digest: None,
                 action_key: None,
+                environment: explain_environment(&environment, config.environment),
                 inputs: Vec::new(),
                 outputs: Vec::new(),
             },
@@ -344,6 +356,7 @@ fn explain(arguments: &[OsString], json: bool) -> Result<i32, String> {
                 compiler_major: None,
                 compiler_digest: None,
                 action_key: None,
+                environment: explain_environment(&environment, config.environment),
                 inputs: Vec::new(),
                 outputs: Vec::new(),
             },
@@ -351,15 +364,15 @@ fn explain(arguments: &[OsString], json: bool) -> Result<i32, String> {
             1,
         );
     }
-    let fingerprint = fingerprint_gfortran(compiler).map_err(|error| error.to_string())?;
-    if !supported_gfortran_major(fingerprint.major_version) {
+    if let Some((name, _)) = unsupported_compiler_environment(&environment) {
         return emit_explain(
             ExplainReport {
                 decision: "bypass",
-                reason: Some("unsupported-compiler-version".into()),
-                compiler_major: Some(fingerprint.major_version),
-                compiler_digest: Some(fingerprint.digest_hex()),
+                reason: Some(format!("unsupported-environment: {name}")),
+                compiler_major: None,
+                compiler_digest: None,
                 action_key: None,
+                environment: explain_environment(&environment, config.environment),
                 inputs: Vec::new(),
                 outputs: Vec::new(),
             },
@@ -368,6 +381,25 @@ fn explain(arguments: &[OsString], json: bool) -> Result<i32, String> {
         );
     }
     let cwd = env::current_dir().map_err(|error| error.to_string())?;
+    let fingerprint_context = FingerprintContext::new(compiler, &cwd, environment.iter().cloned());
+    let fingerprint =
+        fingerprint_gfortran_in(&fingerprint_context).map_err(|error| error.to_string())?;
+    if !supported_gfortran_major(fingerprint.major_version) {
+        return emit_explain(
+            ExplainReport {
+                decision: "bypass",
+                reason: Some("unsupported-compiler-version".into()),
+                compiler_major: Some(fingerprint.major_version),
+                compiler_digest: Some(fingerprint.digest_hex()),
+                action_key: None,
+                environment: explain_environment(&environment, config.environment),
+                inputs: Vec::new(),
+                outputs: Vec::new(),
+            },
+            json,
+            1,
+        );
+    }
     let mut probe_telemetry = ProbeTelemetry::default();
     let observation = match observe(
         compiler,
@@ -386,6 +418,7 @@ fn explain(arguments: &[OsString], json: bool) -> Result<i32, String> {
                     compiler_major: Some(fingerprint.major_version),
                     compiler_digest: Some(fingerprint.digest_hex()),
                     action_key: None,
+                    environment: explain_environment(&environment, config.environment),
                     inputs: Vec::new(),
                     outputs: Vec::new(),
                 },
@@ -408,16 +441,27 @@ fn explain(arguments: &[OsString], json: bool) -> Result<i32, String> {
                 &fingerprint,
                 None,
                 &observation,
+                &environment,
+                config.environment,
             ),
             json,
             1,
         );
     }
+    let key_environment = keyed_environment(&environment, config.environment);
     let action =
-        build_action_key(compiler, &invocation, &fingerprint, &cwd, &environment, &observation)
+        build_action_key(compiler, &invocation, &fingerprint, &cwd, &key_environment, &observation)
             .map_err(|error| error.to_string())?;
     emit_explain(
-        explain_report("cacheable", None, &fingerprint, Some(action.to_string()), &observation),
+        explain_report(
+            "cacheable",
+            None,
+            &fingerprint,
+            Some(action.to_string()),
+            &observation,
+            &environment,
+            config.environment,
+        ),
         json,
         0,
     )
@@ -429,6 +473,8 @@ fn explain_report(
     fingerprint: &CompilerFingerprint,
     action_key: Option<String>,
     observation: &Observation,
+    environment: &[(OsString, OsString)],
+    environment_policy: EnvironmentPolicy,
 ) -> ExplainReport {
     ExplainReport {
         decision,
@@ -436,6 +482,7 @@ fn explain_report(
         compiler_major: Some(fingerprint.major_version),
         compiler_digest: Some(fingerprint.digest_hex()),
         action_key,
+        environment: explain_environment(environment, environment_policy),
         inputs: observation
             .inputs
             .iter()
@@ -476,6 +523,13 @@ fn emit_explain(report: ExplainReport, json: bool, exit_code: i32) -> Result<i32
         }
         if let Some(action) = &report.action_key {
             println!("action key: {action}");
+        }
+        println!("environment mode: {}", report.environment.mode);
+        for name in &report.environment.keyed {
+            println!("environment keyed: {name}");
+        }
+        for name in &report.environment.ignored {
+            println!("environment ignored: {name}");
         }
         for input in &report.inputs {
             println!("input: {} {} {}", input.digest, input.size, input.path);
@@ -527,8 +581,13 @@ fn run_compiler(arguments: Vec<OsString>, config: &Config) -> Result<i32, String
         record_bypass(&mut stats, "dependency-probe-preprocessing");
         return pass_through(compiler, compiler_args, &environment);
     }
+    if let Some((_, reason)) = unsupported_compiler_environment(&environment) {
+        record_bypass(&mut stats, reason);
+        return pass_through(compiler, compiler_args, &environment);
+    }
     record(&mut stats, None, |value| value.requests += 1);
     let cwd = env::current_dir().map_err(|error| error.to_string())?;
+    let key_environment = keyed_environment(&environment, config.environment);
     let store = match CacheStore::new(&config.cache_dir) {
         Ok(value) => value,
         Err(_) => {
@@ -540,8 +599,8 @@ fn run_compiler(arguments: Vec<OsString>, config: &Config) -> Result<i32, String
             return pass_through(compiler, compiler_args, &environment);
         }
     };
-    let identity_context =
-        FingerprintContext::new(compiler, &cwd, relevant_environment(&environment));
+    let identity_context = FingerprintContext::new(compiler, &cwd, environment.iter().cloned())
+        .key_environment(key_environment.iter().cloned());
     let identity_started = Instant::now();
     let identity = match CompilerIdentityCache::new(&config.cache_dir, config.read_only).lookup(
         &identity_context,
@@ -575,7 +634,7 @@ fn run_compiler(arguments: Vec<OsString>, config: &Config) -> Result<i32, String
         && !invocation.syntax_only
         && !legacy_cpp_requires_observation
     {
-        direct_request_key(compiler, compiler_args, &invocation, &cwd, &environment).ok()
+        direct_request_key(compiler, compiler_args, &invocation, &cwd, &key_environment).ok()
     } else {
         None
     };
@@ -588,7 +647,7 @@ fn run_compiler(arguments: Vec<OsString>, config: &Config) -> Result<i32, String
             compiler,
             &invocation,
             &cwd,
-            &environment,
+            &key_environment,
             &identity,
             &mut stats,
         ) {
@@ -660,7 +719,7 @@ fn run_compiler(arguments: Vec<OsString>, config: &Config) -> Result<i32, String
                     &invocation,
                     fingerprint,
                     &cwd,
-                    &environment,
+                    &key_environment,
                     &observation,
                 )
             },
@@ -958,12 +1017,11 @@ fn direct_request_key(
     compiler_args: &[OsString],
     invocation: &GfortranInvocation,
     cwd: &Path,
-    environment: &[(OsString, OsString)],
+    key_environment: &[(OsString, OsString)],
 ) -> Result<DirectRequestKey, String> {
     let source = invocation.source.as_ref().ok_or_else(|| "missing source input".to_owned())?;
     let source_path = absolute_output(cwd, PathBuf::from(source));
     let source_input = read_stable(&source_path)?;
-    let relevant_environment = relevant_environment(environment);
     let semantics = vec![
         (b"action-schema".to_vec(), KEY_SCHEMA.to_vec()),
         (b"preprocessing".to_vec(), format!("{:?}", invocation.preprocessing).into_bytes()),
@@ -974,7 +1032,7 @@ fn direct_request_key(
         compiler,
         cwd,
         compiler_args,
-        &relevant_environment,
+        key_environment,
         &source_path,
         DirectDigest::from_bytes(source_input.digest),
         &semantics,
@@ -989,7 +1047,7 @@ fn try_direct_restore(
     compiler: &OsStr,
     invocation: &GfortranInvocation,
     cwd: &Path,
-    environment: &[(OsString, OsString)],
+    key_environment: &[(OsString, OsString)],
     identity: &ValidatedCompilerIdentity,
     stats: &mut PendingStats,
 ) -> Result<DirectAttempt, String> {
@@ -1038,7 +1096,7 @@ fn try_direct_restore(
             compiler,
             invocation,
             cwd,
-            environment,
+            key_environment,
             identity,
         ) {
             Ok(value) => value,
@@ -1109,7 +1167,7 @@ fn try_direct_restore(
             compiler,
             invocation,
             cwd,
-            environment,
+            key_environment,
             identity,
         ) {
             Ok(value) => value,
@@ -1136,7 +1194,7 @@ fn validate_direct_candidate<'a>(
     compiler: &OsStr,
     invocation: &GfortranInvocation,
     cwd: &Path,
-    environment: &[(OsString, OsString)],
+    key_environment: &[(OsString, OsString)],
     identity: &ValidatedCompilerIdentity,
 ) -> Result<(Observation, crate::cache::direct::ValidatedDirectRecord<'a>), &'static str> {
     if candidate.compiler.context_key != compiler_context
@@ -1151,7 +1209,7 @@ fn validate_direct_candidate<'a>(
         invocation,
         identity.fingerprint(),
         cwd,
-        environment,
+        key_environment,
         &observation,
     )
     .map_err(|_| "action-key")?;
@@ -1545,12 +1603,11 @@ fn direct_search_environment_is_unmodeled(environment: &[(OsString, OsString)]) 
     })
 }
 
-fn relevant_environment(environment: &[(OsString, OsString)]) -> Vec<(OsString, OsString)> {
-    environment
-        .iter()
-        .filter(|(name, _)| environment_affects_compiler_output(name))
-        .cloned()
-        .collect()
+fn keyed_environment(
+    environment: &[(OsString, OsString)],
+    policy: EnvironmentPolicy,
+) -> Vec<(OsString, OsString)> {
+    environment.iter().filter(|(name, _)| environment_is_keyed(policy, name)).cloned().collect()
 }
 
 fn is_module_path(path: &Path) -> bool {
@@ -2316,9 +2373,7 @@ fn build_action_key(
     for (index, argument) in invocation.original_args.iter().enumerate() {
         builder.add_os_str(&format!("argument-{index:08}"), argument);
     }
-    for (index, (name, value)) in
-        environment.iter().filter(|(name, _)| environment_affects_compiler_output(name)).enumerate()
-    {
+    for (index, (name, value)) in environment.iter().enumerate() {
         builder.add_os_str(&format!("environment-name-{index:08}"), name);
         builder.add_os_str(&format!("environment-value-{index:08}"), value);
     }
@@ -2670,8 +2725,110 @@ fn filter_compiler_environment(
     environment
 }
 
-fn environment_affects_compiler_output(name: &OsStr) -> bool {
-    !matches!(encoded_os(name).as_slice(), b"MAKEFLAGS" | b"MFLAGS")
+fn environment_policy_name(policy: EnvironmentPolicy) -> &'static str {
+    match policy {
+        EnvironmentPolicy::Strict => "strict",
+        EnvironmentPolicy::Compiler => "compiler",
+    }
+}
+
+fn environment_is_keyed(policy: EnvironmentPolicy, name: &OsStr) -> bool {
+    let name = encoded_os(name);
+    if matches!(name.as_slice(), b"MAKEFLAGS" | b"MFLAGS") {
+        return false;
+    }
+    match policy {
+        EnvironmentPolicy::Strict => true,
+        EnvironmentPolicy::Compiler => gfortran_environment_is_keyed(&name),
+    }
+}
+
+fn gfortran_environment_is_keyed(name: &[u8]) -> bool {
+    const EXACT: &[&[u8]] = &[
+        b"AR",
+        b"AS",
+        b"CLICOLOR",
+        b"CLICOLOR_FORCE",
+        b"COLLECT_GCC",
+        b"COLLECT_GCC_OPTIONS",
+        b"COLUMNS",
+        b"COMPILER_PATH",
+        b"CPATH",
+        b"CPLUS_INCLUDE_PATH",
+        b"C_INCLUDE_PATH",
+        b"DEPENDENCIES_OUTPUT",
+        b"DEVELOPER_DIR",
+        b"GCC_EXEC_PREFIX",
+        b"GFORTRAN_INCLUDE_PATH",
+        b"GNUTARGET",
+        b"HOME",
+        b"LANG",
+        b"LANGUAGE",
+        b"LD",
+        b"LDEMULATION",
+        b"LIBRARY_PATH",
+        b"MACOSX_DEPLOYMENT_TARGET",
+        b"NLSPATH",
+        b"NM",
+        b"NO_COLOR",
+        b"OBJCOPY",
+        b"OBJCPLUS_INCLUDE_PATH",
+        b"OBJC_INCLUDE_PATH",
+        b"PATH",
+        b"RANLIB",
+        b"SDKROOT",
+        b"SOURCE_DATE_EPOCH",
+        b"STRIP",
+        b"SUNPRO_DEPENDENCIES",
+        b"TEMP",
+        b"TERM",
+        b"TMP",
+        b"TMPDIR",
+        b"TZ",
+    ];
+    const PREFIXES: &[&[u8]] = &[
+        b"ASAN_",
+        b"DYLD_",
+        b"GCC_",
+        b"GFORTRAN_",
+        b"LC_",
+        b"LD_",
+        b"LSAN_",
+        b"MSAN_",
+        b"TSAN_",
+        b"UBSAN_",
+    ];
+    EXACT.contains(&name) || PREFIXES.iter().any(|prefix| name.starts_with(prefix))
+}
+
+fn unsupported_compiler_environment(
+    environment: &[(OsString, OsString)],
+) -> Option<(&'static str, &'static str)> {
+    const UNSUPPORTED: &[(&[u8], &str, &str)] = &[
+        (b"DEPENDENCIES_OUTPUT", "DEPENDENCIES_OUTPUT", "environment-dependencies-output"),
+        (b"GCC_DIAGNOSTICS_LOG", "GCC_DIAGNOSTICS_LOG", "environment-diagnostics-log"),
+        (b"SUNPRO_DEPENDENCIES", "SUNPRO_DEPENDENCIES", "environment-sunpro-dependencies"),
+    ];
+    UNSUPPORTED.iter().find_map(|(expected, display, reason)| {
+        environment
+            .iter()
+            .any(|(name, _)| encoded_os(name) == *expected)
+            .then_some((*display, *reason))
+    })
+}
+
+fn explain_environment(
+    environment: &[(OsString, OsString)],
+    policy: EnvironmentPolicy,
+) -> ExplainEnvironment {
+    let mut keyed = Vec::new();
+    let mut ignored = Vec::new();
+    for (name, _) in environment {
+        let destination =
+            if environment_is_keyed(policy, name) { &mut keyed } else { &mut ignored };
+        destination.push(name.to_string_lossy().into_owned());
+    }
+    ExplainEnvironment { mode: environment_policy_name(policy), keyed, ignored }
 }
 
 fn record(stats: &mut PendingStats, key: Option<&str>, update: impl FnOnce(&mut Stats)) {
@@ -2874,7 +3031,7 @@ mod tests {
     }
 
     #[test]
-    fn excludes_make_jobserver_metadata_only_from_action_keys() {
+    fn strict_environment_excludes_only_make_jobserver_metadata() {
         let values = filter_compiler_environment([
             (OsString::from("MAKEFLAGS"), OsString::from("-j12 --jobserver-auth=fifo:/tmp/one")),
             (OsString::from("MFLAGS"), OsString::from("-j12 --jobserver-auth=fifo:/tmp/one")),
@@ -2883,9 +3040,45 @@ mod tests {
 
         assert!(values.iter().any(|(name, _)| name == "MAKEFLAGS"));
         assert!(values.iter().any(|(name, _)| name == "MFLAGS"));
-        assert!(!environment_affects_compiler_output(OsStr::new("MAKEFLAGS")));
-        assert!(!environment_affects_compiler_output(OsStr::new("MFLAGS")));
-        assert!(environment_affects_compiler_output(OsStr::new("PATH")));
+        assert!(!environment_is_keyed(EnvironmentPolicy::Strict, OsStr::new("MAKEFLAGS")));
+        assert!(!environment_is_keyed(EnvironmentPolicy::Strict, OsStr::new("MFLAGS")));
+        assert!(environment_is_keyed(EnvironmentPolicy::Strict, OsStr::new("PATH")));
+        assert!(environment_is_keyed(EnvironmentPolicy::Strict, OsStr::new("GITHUB_RUN_ID")));
+    }
+
+    #[test]
+    fn compiler_environment_keys_toolchain_inputs_not_ci_metadata() {
+        for name in [
+            "PATH",
+            "CPATH",
+            "GFORTRAN_INCLUDE_PATH",
+            "GCC_EXEC_PREFIX",
+            "GCC_COLORS",
+            "LC_ALL",
+            "LD_PRELOAD",
+            "SOURCE_DATE_EPOCH",
+            "MACOSX_DEPLOYMENT_TARGET",
+        ] {
+            assert!(environment_is_keyed(EnvironmentPolicy::Compiler, OsStr::new(name)), "{name}");
+        }
+        for name in ["GITHUB_RUN_ID", "GITHUB_SHA", "RUNNER_TRACKING_ID", "SHLVL", "_"] {
+            assert!(!environment_is_keyed(EnvironmentPolicy::Compiler, OsStr::new(name)), "{name}");
+        }
+    }
+
+    #[test]
+    fn environments_with_untracked_compiler_outputs_are_unsupported() {
+        for (name, reason) in [
+            ("DEPENDENCIES_OUTPUT", "environment-dependencies-output"),
+            ("GCC_DIAGNOSTICS_LOG", "environment-diagnostics-log"),
+            ("SUNPRO_DEPENDENCIES", "environment-sunpro-dependencies"),
+        ] {
+            let environment = [(OsString::from(name), OsString::from("output"))];
+            assert_eq!(
+                unsupported_compiler_environment(&environment).map(|value| value.1),
+                Some(reason)
+            );
+        }
     }
 
     #[test]
