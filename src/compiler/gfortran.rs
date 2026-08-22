@@ -661,7 +661,7 @@ fn is_argument_carrier(arg: &[u8]) -> bool {
 }
 
 fn is_safe_argument_carrier(arg: &[u8]) -> bool {
-    arg == b"-Wa,--noexecstack"
+    matches!(arg, b"-Wa,--execstack" | b"-Wa,--noexecstack")
 }
 
 fn is_file_diagnostic(arg: &[u8]) -> bool {
@@ -1066,20 +1066,22 @@ mod tests {
 
     #[test]
     fn accepts_wsjtx_linux_options() {
-        let command = args(&[
-            "-c",
-            "-cpp",
-            "-Wa,--noexecstack",
-            "-fsanitize=address,undefined",
-            "-fno-sanitize-recover=all",
-            "-fno-omit-frame-pointer",
-            "-fdata-sections",
-            "-ffunction-sections",
-            "main.F90",
-        ]);
-        let parsed = parse_args(&command).unwrap();
-        assert_eq!(parsed.cacheability, Cacheability::Cacheable);
-        assert_eq!(parsed.original_args, command);
+        for stack_option in ["-Wa,--execstack", "-Wa,--noexecstack"] {
+            let command = args(&[
+                "-c",
+                "-cpp",
+                stack_option,
+                "-fsanitize=address,undefined",
+                "-fno-sanitize-recover=all",
+                "-fno-omit-frame-pointer",
+                "-fdata-sections",
+                "-ffunction-sections",
+                "main.F90",
+            ]);
+            let parsed = parse_args(&command).unwrap();
+            assert_eq!(parsed.cacheability, Cacheability::Cacheable);
+            assert_eq!(parsed.original_args, command);
+        }
     }
 
     #[test]

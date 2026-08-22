@@ -919,7 +919,18 @@ fn dependency_target_options_preserve_warm_depfiles() {
 
 #[cfg(target_os = "linux")]
 #[test]
-fn wsjtx_linux_flags_preserve_complete_warm_results() {
+fn wsjtx_linux_execstack_flags_preserve_complete_warm_results() {
+    wsjtx_linux_flags_preserve_complete_warm_results("-Wa,--execstack");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn wsjtx_linux_noexecstack_flags_preserve_complete_warm_results() {
+    wsjtx_linux_flags_preserve_complete_warm_results("-Wa,--noexecstack");
+}
+
+#[cfg(target_os = "linux")]
+fn wsjtx_linux_flags_preserve_complete_warm_results(stack_option: &str) {
     if !gfortran_available() {
         return;
     }
@@ -940,7 +951,7 @@ fn wsjtx_linux_flags_preserve_complete_warm_results() {
             "-funroll-all-loops",
             "-fbacktrace",
             "-Wmaybe-uninitialized",
-            "-Wa,--noexecstack",
+            stack_option,
             "-fdata-sections",
             "-ffunction-sections",
             "-fsanitize=undefined",
