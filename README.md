@@ -54,7 +54,7 @@ named `fcache`. The package is not currently published to crates.io.
 Configure fcache as the CMake Fortran compiler launcher:
 
 ```sh
-cmake -S . -B build \
+cmake -S . -B build -G "Unix Makefiles" \
   -DCMAKE_Fortran_COMPILER=gfortran \
   -DCMAKE_Fortran_COMPILER_LAUNCHER=/absolute/path/to/fcache
 cmake --build build
@@ -69,6 +69,23 @@ fcache gfortran -cpp -c source.F90 -o source.o
 Unsupported or uncertain invocations run through the real compiler without
 being cached.
 
+By default, fcache conservatively includes the complete forwarded compiler
+environment, except GNU Make jobserver metadata, in each cache key. CI jobs can
+opt into the gfortran-specific environment model so changing orchestration
+metadata does not invalidate otherwise identical compilations:
+
+```sh
+export FCACHE_ENVIRONMENT=compiler
+cmake --build build
+```
+
+The equivalent configuration-file setting is `environment = "compiler"`.
+Compiler and toolchain variables, including search paths, locale, reproducible
+timestamps, and dynamic-loader controls, remain keyed. Other ambient variables
+are still forwarded unchanged to the compiler but do not affect the key. Use
+`fcache --explain` to inspect the keyed and ignored variable names. The default
+`strict` mode remains available as `FCACHE_ENVIRONMENT=strict`.
+
 Common administrative commands are:
 
 ```text
@@ -81,9 +98,11 @@ fcache --clear
 ```
 
 `--explain` reports whether an invocation is cacheable without running the
-requested compilation or writing its outputs. `--clear` removes only fcache
-data. See [configuration and administration](docs/configuration.md) for the
-configuration file, environment variables, and command semantics.
+requested compilation or writing its outputs. It loads the effective
+configuration so its action key and environment report match a real compiler
+invocation. `--clear` removes only fcache data. See
+[configuration and administration](docs/configuration.md) for the configuration
+file, environment variables, and command semantics.
 
 ## Supported scope
 

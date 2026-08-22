@@ -19,6 +19,7 @@ The first public release is planned as `0.1.0-alpha.1`.
 - A tag-driven release workflow for native Apple silicon and Intel macOS binaries, plus GNU/glibc and static musl Linux x86-64 binaries, SHA-256 checksums, and build provenance attestations.
 - Packaged-binary release qualification covering native execution, cold/warm object, module, and depfile identity, architecture and linkage audits, the macOS 11 deployment target, and the glibc 2.28 symbol ceiling.
 - The Cargo package name `fortran-fcache`, with the executable and Rust library named `fcache`.
+- An opt-in gfortran environment model for reusable CI cache keys, with keyed and ignored variable names exposed by `--explain`.
 
 ### Correctness and safety
 
@@ -30,3 +31,5 @@ The first public release is planned as `0.1.0-alpha.1`.
 - Direct observations are invalidated when compiler tools, external specifications, search resolution, missing candidates, process umask, or output identities change.
 - Volatile preprocessing is hashed or kept on the compiler-assisted path when the compiler cannot prove deterministic expansion.
 - Cache publication is atomic, and manifests, blobs, paths, and dependencies are validated before restoration.
+- Strict complete-environment keying remains the default during the alpha; modeled environment keying continues to include compiler, toolchain, locale, reproducibility, and dynamic-loader inputs.
+- Environment variables that request dependency or diagnostic files outside the observed output bundle pass through instead of being cached.
