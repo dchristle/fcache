@@ -951,6 +951,7 @@ fn wsjtx_linux_flags_preserve_complete_warm_results(stack_option: &str) {
             "-funroll-all-loops",
             "-fbacktrace",
             "-Wmaybe-uninitialized",
+            "-Werror=trampolines",
             stack_option,
             "-fdata-sections",
             "-ffunction-sections",
@@ -1804,6 +1805,73 @@ fn warnings_are_replayed_on_warm_hit() {
     assert_eq!(result.requests, 2);
     assert_eq!(result.misses, 1);
     assert_eq!(result.hits, 1);
+}
+
+#[test]
+fn diagnostic_option_spelling_participates_in_the_action_key() {
+    if !gfortran_available() {
+        return;
+    }
+    let fixture = Fixture::new();
+    fixture.copy_fixture("basic.F90");
+    fixture.modules();
+    let compile = |warning: &str| {
+        cached_output(
+            &fixture,
+            &[
+                "-cpp",
+                warning,
+                "-MD",
+                "-MF",
+                "basic.d",
+                "-J",
+                "modules",
+                "-c",
+                "basic.F90",
+                "-o",
+                "basic.o",
+            ],
+        )
+    };
+
+    assert_success(&compile("-Werror=trampolines"), "first diagnostic spelling");
+    fixture.remove_outputs(&["basic.o", "basic.d"]);
+    assert_success(&compile("-Wno-error=trampolines"), "second diagnostic spelling");
+    fixture.remove_outputs(&["basic.o", "basic.d"]);
+    assert_success(&compile("-Werror=trampolines"), "repeated diagnostic spelling");
+
+    let result = stats(&fixture);
+    assert_eq!(result.requests, 3);
+    assert_eq!(result.misses, 2, "distinct warning arguments require distinct actions");
+    assert_eq!(result.hits, 1, "an identical warning argument should hit");
+}
+
+#[test]
+fn modeled_preprocessor_carrier_preserves_complete_warm_results() {
+    if !gfortran_available() {
+        return;
+    }
+    let fixture = Fixture::new();
+    fs::write(
+        fixture.path("carrier.F90"),
+        "#if VALUE != 7\n#error unexpected carrier value\n#endif\nsubroutine carrier()\nend subroutine carrier\n",
+    )
+    .expect("write preprocessor carrier fixture");
+    differential_action(
+        "gfortran",
+        &fixture,
+        &[
+            "-cpp",
+            "-Wp,-DVALUE=7",
+            "-MD",
+            "-MF",
+            "carrier.d",
+            "-c",
+            "carrier.F90",
+            "-o",
+            "carrier.o",
+        ],
+    );
 }
 
 #[test]

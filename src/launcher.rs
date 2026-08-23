@@ -2917,6 +2917,8 @@ fn bypass_name(reason: &BypassReason) -> &'static str {
         BypassReason::AutoFdo => "autofdo",
         BypassReason::LanguageOverride => "language-override",
         BypassReason::ArgumentCarrier => "argument-carrier",
+        BypassReason::ArgumentCarrierInput => "argument-carrier-input",
+        BypassReason::ArgumentCarrierOutput => "argument-carrier-output",
         BypassReason::UnknownOption(_) => "unknown-option",
         BypassReason::MissingDependencyProbePreprocessing => "dependency-probe-preprocessing",
         BypassReason::DuplicateModuleDirectory => "duplicate-module-directory",

@@ -38,6 +38,8 @@ pub enum BypassReason {
     AutoFdo,
     LanguageOverride,
     ArgumentCarrier,
+    ArgumentCarrierInput,
+    ArgumentCarrierOutput,
     PluginOrSpecs,
     UnknownOption(OsString),
     MissingDependencyProbePreprocessing,
@@ -316,14 +318,25 @@ pub fn parse_args(args: &[OsString]) -> Result<GfortranInvocation, ParseError> {
             index += 2;
             continue;
         }
-        if !end_options && is_safe_argument_carrier(&bytes) {
-            invocation.extra_args.push(arg.clone());
+        if !end_options && is_argument_carrier(&bytes) {
+            let effect = argument_carrier_effect(&bytes).expect("recognized argument carrier");
+            if effect.is_cacheable() {
+                invocation.extra_args.push(arg.clone());
+            } else {
+                mark_bypass(&mut invocation, effect.bypass_reason());
+            }
             index += 1;
             continue;
         }
         if !end_options && is_separate_argument_carrier(&bytes) {
-            let _ = next_value(args, index, arg)?;
-            mark_bypass(&mut invocation, BypassReason::ArgumentCarrier);
+            let value = next_value(args, index, arg)?;
+            let effect = separate_argument_carrier_effect(&bytes, &encoded(&value));
+            if effect.is_cacheable() {
+                invocation.extra_args.push(arg.clone());
+                invocation.extra_args.push(value);
+            } else {
+                mark_bypass(&mut invocation, effect.bypass_reason());
+            }
             index += 2;
             continue;
         }
@@ -647,28 +660,215 @@ fn is_language_override(arg: &[u8]) -> bool {
     arg.starts_with(b"-x")
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CarrierStage {
+    Preprocessor,
+    Assembler,
+    Linker,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CarriedArgumentEffect {
+    Diagnostics,
+    KeyedSemantics,
+    UnmodeledInput,
+    UnmodeledOutput,
+    Unknown,
+}
+
+impl CarriedArgumentEffect {
+    fn is_cacheable(self) -> bool {
+        matches!(self, Self::Diagnostics | Self::KeyedSemantics)
+    }
+
+    fn bypass_reason(self) -> BypassReason {
+        match self {
+            Self::UnmodeledInput => BypassReason::ArgumentCarrierInput,
+            Self::UnmodeledOutput => BypassReason::ArgumentCarrierOutput,
+            Self::Unknown => BypassReason::ArgumentCarrier,
+            Self::Diagnostics | Self::KeyedSemantics => {
+                unreachable!("cacheable carrier effect has no bypass reason")
+            }
+        }
+    }
+}
+
 fn is_separate_argument_carrier(arg: &[u8]) -> bool {
-    matches!(arg, b"-Wp" | b"-Wa" | b"-Wl" | b"-Xpreprocessor" | b"-Xassembler" | b"-Xlinker")
+    separate_argument_carrier_stage(arg).is_some()
 }
 
 fn is_argument_carrier(arg: &[u8]) -> bool {
-    arg.starts_with(b"-Wp,")
-        || arg.starts_with(b"-Wa,")
-        || arg.starts_with(b"-Wl,")
-        || arg.starts_with(b"-Xpreprocessor=")
-        || arg.starts_with(b"-Xassembler=")
-        || arg.starts_with(b"-Xlinker=")
+    argument_carrier_effect(arg).is_some()
 }
 
-fn is_safe_argument_carrier(arg: &[u8]) -> bool {
-    matches!(arg, b"-Wa,--execstack" | b"-Wa,--noexecstack")
+fn separate_argument_carrier_stage(arg: &[u8]) -> Option<CarrierStage> {
+    match arg {
+        b"-Wp" | b"-Xpreprocessor" => Some(CarrierStage::Preprocessor),
+        b"-Wa" | b"-Xassembler" | b"--for-assembler" => Some(CarrierStage::Assembler),
+        b"-Wl" | b"-Xlinker" | b"--for-linker" => Some(CarrierStage::Linker),
+        _ => None,
+    }
+}
+
+fn separate_argument_carrier_effect(arg: &[u8], value: &[u8]) -> CarriedArgumentEffect {
+    let Some(stage) = separate_argument_carrier_stage(arg) else {
+        return CarriedArgumentEffect::Unknown;
+    };
+    if matches!(arg, b"-Wp" | b"-Wa" | b"-Wl") {
+        return CarriedArgumentEffect::Unknown;
+    }
+    carried_argument_effect(stage, value)
+}
+
+fn argument_carrier_effect(arg: &[u8]) -> Option<CarriedArgumentEffect> {
+    for (prefix, stage, comma_separated) in [
+        (b"-Wp,".as_slice(), CarrierStage::Preprocessor, true),
+        (b"-Wa,".as_slice(), CarrierStage::Assembler, true),
+        (b"-Wl,".as_slice(), CarrierStage::Linker, true),
+        (b"-Xpreprocessor=".as_slice(), CarrierStage::Preprocessor, false),
+        (b"-Xassembler=".as_slice(), CarrierStage::Assembler, false),
+        (b"-Xlinker=".as_slice(), CarrierStage::Linker, false),
+        (b"--for-assembler=".as_slice(), CarrierStage::Assembler, false),
+        (b"--for-linker=".as_slice(), CarrierStage::Linker, true),
+    ] {
+        let Some(payload) = arg.strip_prefix(prefix) else {
+            continue;
+        };
+        if payload.is_empty() {
+            return Some(CarriedArgumentEffect::Unknown);
+        }
+        if !comma_separated {
+            return Some(carried_argument_effect(stage, payload));
+        }
+        let mut combined = CarriedArgumentEffect::Diagnostics;
+        for value in payload.split(|byte| *byte == b',') {
+            let effect = carried_argument_effect(stage, value);
+            if !effect.is_cacheable() {
+                return Some(effect);
+            }
+            if effect == CarriedArgumentEffect::KeyedSemantics {
+                combined = effect;
+            }
+        }
+        return Some(combined);
+    }
+    None
+}
+
+fn carried_argument_effect(stage: CarrierStage, arg: &[u8]) -> CarriedArgumentEffect {
+    match stage {
+        CarrierStage::Preprocessor => preprocessor_argument_effect(arg),
+        CarrierStage::Assembler => assembler_argument_effect(arg),
+        CarrierStage::Linker => linker_argument_effect(arg),
+    }
+}
+
+fn preprocessor_argument_effect(arg: &[u8]) -> CarriedArgumentEffect {
+    if is_safe_warning_option(arg) {
+        return CarriedArgumentEffect::Diagnostics;
+    }
+    if ((arg.starts_with(b"-D") || arg.starts_with(b"-U")) && arg.len() > 2)
+        || matches!(arg, b"-undef" | b"-P" | b"-traditional-cpp")
+    {
+        return CarriedArgumentEffect::KeyedSemantics;
+    }
+    if arg.starts_with(b"@")
+        || arg.starts_with(b"-I")
+        || arg.starts_with(b"-include")
+        || arg.starts_with(b"-imacros")
+        || arg.starts_with(b"-iquote")
+        || arg.starts_with(b"-isystem")
+        || arg.starts_with(b"-idirafter")
+        || arg.starts_with(b"-isysroot")
+    {
+        return CarriedArgumentEffect::UnmodeledInput;
+    }
+    if matches!(arg, b"-M" | b"-MM" | b"-MD" | b"-MMD" | b"-MF" | b"-MT" | b"-MQ")
+        || arg.starts_with(b"-MF")
+        || arg.starts_with(b"-o")
+    {
+        return CarriedArgumentEffect::UnmodeledOutput;
+    }
+    CarriedArgumentEffect::Unknown
+}
+
+fn assembler_argument_effect(arg: &[u8]) -> CarriedArgumentEffect {
+    if matches!(arg, b"-W" | b"--no-warn" | b"--warn" | b"--fatal-warnings") {
+        return CarriedArgumentEffect::Diagnostics;
+    }
+    if matches!(
+        arg,
+        b"--execstack"
+            | b"--noexecstack"
+            | b"--compress-debug-sections"
+            | b"--nocompress-debug-sections"
+            | b"--gdwarf-sections"
+            | b"--keep-locals"
+            | b"--no-pad-sections"
+            | b"-g"
+            | b"-J"
+            | b"-K"
+            | b"-L"
+    ) || has_value_prefix(
+        arg,
+        &[
+            b"--compress-debug-sections=",
+            b"--debug-prefix-map=",
+            b"--defsym=",
+            b"--elf-stt-common=",
+            b"--gdwarf-cie-version=",
+            b"--generate-missing-build-notes=",
+            b"--hash-size=",
+            b"--multibyte-handling=",
+            b"--reloc-section-sym=",
+        ],
+    ) || arg.starts_with(b"--gdwarf-")
+    {
+        return CarriedArgumentEffect::KeyedSemantics;
+    }
+    if arg.starts_with(b"@") || arg.starts_with(b"-I") {
+        return CarriedArgumentEffect::UnmodeledInput;
+    }
+    if arg == b"-o"
+        || arg.starts_with(b"-o")
+        || arg == b"--MD"
+        || arg.starts_with(b"--MD=")
+        || arg.starts_with(b"-a")
+    {
+        return CarriedArgumentEffect::UnmodeledOutput;
+    }
+    CarriedArgumentEffect::Unknown
+}
+
+fn linker_argument_effect(arg: &[u8]) -> CarriedArgumentEffect {
+    if arg.starts_with(b"@")
+        || arg.starts_with(b"-L")
+        || arg.starts_with(b"-l")
+        || arg.starts_with(b"-rpath")
+        || arg.starts_with(b"--rpath")
+        || arg.starts_with(b"-T")
+        || arg.starts_with(b"--script")
+        || arg.starts_with(b"--version-script")
+        || arg.starts_with(b"--dynamic-list")
+    {
+        return CarriedArgumentEffect::UnmodeledInput;
+    }
+    if arg == b"-o"
+        || arg.starts_with(b"-o")
+        || arg.starts_with(b"-Map")
+        || arg.starts_with(b"--Map")
+        || arg.starts_with(b"--dependency-file")
+    {
+        return CarriedArgumentEffect::UnmodeledOutput;
+    }
+    CarriedArgumentEffect::Unknown
 }
 
 fn is_file_diagnostic(arg: &[u8]) -> bool {
     arg.starts_with(b"-fdiagnostics-file=")
         || arg.starts_with(b"-fdiagnostics-add-output=")
         || arg.starts_with(b"-fdiagnostics-set-output=")
-        || arg.starts_with(b"-fdiagnostics-format=sarif")
+        || matches!(arg, b"-fdiagnostics-format=sarif-file" | b"-fdiagnostics-format=json-file")
 }
 
 fn is_separate_value_option(arg: &[u8]) -> bool {
@@ -718,6 +918,7 @@ fn is_safe_option(arg: &[u8]) -> bool {
         || arg.starts_with(b"-idirafter")
         || has_value_prefix(arg, &[b"-F"])
         || is_safe_instrumentation_option(arg)
+        || is_stream_diagnostic_option(arg)
 }
 
 fn is_safe_optimization_option(arg: &[u8]) -> bool {
@@ -725,40 +926,44 @@ fn is_safe_optimization_option(arg: &[u8]) -> bool {
 }
 
 fn is_safe_warning_option(arg: &[u8]) -> bool {
+    arg == b"-w" || arg == b"-W" || arg.strip_prefix(b"-W").is_some_and(|name| !name.is_empty())
+}
+
+fn is_stream_diagnostic_option(arg: &[u8]) -> bool {
     matches!(
         arg,
-        b"-w"
-            | b"-Wall"
-            | b"-Wextra"
-            | b"-Werror"
-            | b"-Wpedantic"
-            | b"-Wconversion"
-            | b"-Wconversion-extra"
-            | b"-Wimplicit-interface"
-            | b"-Wimplicit-procedure"
-            | b"-Winteger-division"
-            | b"-Wintrinsic-shadow"
-            | b"-Wintrinsics-std"
-            | b"-Wline-truncation"
-            | b"-Wreal-q-constant"
-            | b"-Wsurprising"
-            | b"-Wunderflow"
-            | b"-Warray-temporaries"
-            | b"-Wcharacter-truncation"
-            | b"-Wfunction-elimination"
-            | b"-Wrealloc-lhs"
-            | b"-Wrealloc-lhs-all"
-            | b"-Wcompare-reals"
-            | b"-Wtarget-lifetime"
-            | b"-Wdo-subscript"
-            | b"-Wuse-without-only"
-            | b"-Wno-align-commons"
-            | b"-Wno-aliasing"
-            | b"-Wno-c-binding-type"
-            | b"-Wno-conversion"
-            | b"-Wno-unused-dummy-argument"
-            | b"-Wmaybe-uninitialized"
-    )
+        b"-fdiagnostics-all-candidates"
+            | b"-fdiagnostics-generate-patch"
+            | b"-fdiagnostics-json-formatting"
+            | b"-fno-diagnostics-json-formatting"
+            | b"-fdiagnostics-parseable-fixits"
+            | b"-fno-diagnostics-parseable-fixits"
+            | b"-fdiagnostics-plain-output"
+            | b"-fdiagnostics-color"
+            | b"-fdiagnostics-urls"
+            | b"-fdiagnostics-format=text"
+            | b"-fdiagnostics-format=sarif-stderr"
+            | b"-fdiagnostics-format=json"
+            | b"-fdiagnostics-format=json-stderr"
+            | b"-fshow-column"
+            | b"-fno-show-column"
+    ) || arg.starts_with(b"-fdiagnostics-show-")
+        || arg.starts_with(b"-fno-diagnostics-show-")
+        || has_value_prefix(
+            arg,
+            &[
+                b"-fdiagnostics-color=",
+                b"-fdiagnostics-column-origin=",
+                b"-fdiagnostics-column-unit=",
+                b"-fdiagnostics-escape-format=",
+                b"-fdiagnostics-minimum-margin-width=",
+                b"-fdiagnostics-path-format=",
+                b"-fdiagnostics-text-art-charset=",
+                b"-fdiagnostics-urls=",
+                b"-fmax-errors=",
+                b"-fmessage-length=",
+            ],
+        )
 }
 
 fn is_safe_fortran_option(arg: &[u8]) -> bool {
@@ -1029,6 +1234,29 @@ mod tests {
     }
 
     #[test]
+    fn accepts_diagnostic_option_family() {
+        for option in [
+            "-W",
+            "-Wall",
+            "-Werror",
+            "-Werror=trampolines",
+            "-Wno-error=trampolines",
+            "-Wformat=2",
+            "-Wno-future-gfortran-warning",
+            "-fdiagnostics-color=never",
+            "-fdiagnostics-format=sarif-stderr",
+            "-fdiagnostics-show-option",
+            "-fno-diagnostics-show-caret",
+            "-fmax-errors=4",
+            "-fmessage-length=120",
+            "-w",
+        ] {
+            let parsed = parse_args(&args(&["-c", option, "main.f90"])).unwrap();
+            assert_eq!(parsed.cacheability, Cacheability::Cacheable, "option: {option}");
+        }
+    }
+
+    #[test]
     fn accepts_wsjtx_macos_options() {
         let command = args(&[
             "-c",
@@ -1076,6 +1304,7 @@ mod tests {
                 "-fno-omit-frame-pointer",
                 "-fdata-sections",
                 "-ffunction-sections",
+                "-Werror=trampolines",
                 "main.F90",
             ]);
             let parsed = parse_args(&command).unwrap();
@@ -1111,8 +1340,6 @@ mod tests {
             "-fno-f2cc",
             "-ffpe-summary=",
             "-ffpe-summaries=all",
-            "-Wno-conversions",
-            "-Wno-c-binding-types",
             "-fno-second-underscores",
             "-fvisibility=default",
         ] {
@@ -1156,7 +1383,7 @@ mod tests {
     fn bypasses_file_diagnostics() {
         for option in [
             "-fdiagnostics-format=sarif-file",
-            "-fdiagnostics-format=sarif-stderr",
+            "-fdiagnostics-format=json-file",
             "-fdiagnostics-file=main.diag",
             "-fdiagnostics-add-output=sarif:file=main.sarif",
         ] {
@@ -1174,25 +1401,62 @@ mod tests {
     }
 
     #[test]
-    fn bypasses_argument_carriers() {
+    fn accepts_modeled_argument_carriers() {
         for option in [
             "-Wp,-DVALUE=1",
-            "-Wa,--compress-debug-sections",
-            "-Wa,--fatal-warnings",
-            "-Wa,-a=listing.lst",
-            "-Wl,-rpath,/tmp/lib",
+            "-Wp,-Wundef",
+            "-Wa,--execstack",
+            "-Wa,--noexecstack",
+            "-Wa,--compress-debug-sections=zlib",
+            "-Wa,--fatal-warnings,--noexecstack",
+            "--for-assembler=--noexecstack",
         ] {
-            assert_bypass(&[option], BypassReason::ArgumentCarrier);
+            let parsed = parse_args(&args(&["-c", option, "main.f90"])).unwrap();
+            assert_eq!(parsed.cacheability, Cacheability::Cacheable, "option: {option}");
         }
         for (option, value) in [
-            ("-Wp", "-DVALUE=1"),
-            ("-Wa", "--compress-debug-sections"),
-            ("-Wl", "-rpath"),
             ("-Xpreprocessor", "-DVALUE=1"),
-            ("-Xassembler", "--compress-debug-sections"),
-            ("-Xlinker", "-rpath"),
+            ("-Xassembler", "--noexecstack"),
+            ("--for-assembler", "--fatal-warnings"),
         ] {
-            assert_bypass(&[option, value], BypassReason::ArgumentCarrier);
+            let parsed = parse_args(&args(&["-c", option, value, "main.f90"])).unwrap();
+            assert_eq!(parsed.cacheability, Cacheability::Cacheable, "option: {option} {value}");
+        }
+    }
+
+    #[test]
+    fn classifies_unmodeled_carrier_inputs_and_outputs() {
+        for option in [
+            "-Wp,@preprocessor.rsp",
+            "-Wp,-include,config.h",
+            "-Wa,@assembler.rsp",
+            "-Wa,-I,assembler-includes",
+            "-Wl,-rpath,/tmp/lib",
+            "-Wl,--version-script,exports.map",
+        ] {
+            assert_bypass(&[option], BypassReason::ArgumentCarrierInput);
+        }
+        for option in
+            ["-Wp,-MF,deps.d", "-Wa,-a=listing.lst", "-Wa,--MD=assembler.d", "-Wl,-Map,link.map"]
+        {
+            assert_bypass(&[option], BypassReason::ArgumentCarrierOutput);
+        }
+    }
+
+    #[test]
+    fn bypasses_unknown_or_unsupported_argument_carriers() {
+        for option in ["-Wa,--target-specific-option", "-Wl,--unknown-linker-option"] {
+            assert_bypass(&[option], BypassReason::ArgumentCarrier);
+        }
+        for (option, value, expected) in [
+            ("-Wp", "-DVALUE=1", BypassReason::ArgumentCarrier),
+            ("-Wa", "--compress-debug-sections", BypassReason::ArgumentCarrier),
+            ("-Wl", "-rpath", BypassReason::ArgumentCarrier),
+            ("-Xpreprocessor", "-include", BypassReason::ArgumentCarrierInput),
+            ("-Xassembler", "-Iassembler-includes", BypassReason::ArgumentCarrierInput),
+            ("-Xlinker", "-rpath", BypassReason::ArgumentCarrierInput),
+        ] {
+            assert_bypass(&[option, value], expected);
         }
     }
 
@@ -1212,7 +1476,7 @@ mod tests {
         {
             assert_bypass(&[option], BypassReason::PluginOrSpecs);
         }
-        for option in ["-funknown-semantic", "-Wunknown-warning", "-munknown-target", "-Ounknown"] {
+        for option in ["-funknown-semantic", "-munknown-target", "-Ounknown"] {
             assert_bypass(&[option], BypassReason::UnknownOption(OsString::from(option)));
         }
     }
@@ -1366,6 +1630,40 @@ mod tests {
                 "-fopenmp",
                 "-I",
                 "modules",
+                "-fsyntax-only",
+                "-cpp",
+                "-Werror=date-time",
+                "-MD",
+                "-MF",
+                "internal.d",
+                "-J",
+                "private",
+                "main.F90",
+            ])
+        );
+    }
+
+    #[test]
+    fn probe_preserves_diagnostics_and_modeled_carriers() {
+        let parsed = parse_args(&args(&[
+            "-c",
+            "-cpp",
+            "-Werror=trampolines",
+            "-fdiagnostics-color=never",
+            "-Wp,-DVALUE=1",
+            "-Wa,--noexecstack",
+            "main.F90",
+        ]))
+        .unwrap();
+        let probe =
+            parsed.dependency_probe_argv(OsStr::new("internal.d"), OsStr::new("private")).unwrap();
+        assert_eq!(
+            probe,
+            args(&[
+                "-Werror=trampolines",
+                "-fdiagnostics-color=never",
+                "-Wp,-DVALUE=1",
+                "-Wa,--noexecstack",
                 "-fsyntax-only",
                 "-cpp",
                 "-Werror=date-time",
